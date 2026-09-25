@@ -1,11 +1,5 @@
-[package]
-name = "fount_launcher"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-tokio = { version = "1.0", features = ["full"] }
-nucleo = "0.5.0"
-serde = "1.0.229"
-zbus = "5.19.0"
-freedesktop-desktop-entry = "0.8.3"
+[workspace]
+resolver = "2"
+members = [
+    "crates/fount-core",
+]
