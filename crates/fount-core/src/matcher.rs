@@ -1,23 +1,23 @@
-use crate::desktop_entry::DesktopEntry;
+use crate::entry::LauncherEntry;
 use nucleo::pattern::{CaseMatching, Normalization};
 use nucleo::{Config, Matcher, Nucleo, Utf32String};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-/// A ranked search result containing the matched desktop entry, match score, and character indices.
+/// A ranked search result containing the matched launcher entry, match score, and character indices.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchResult {
-    /// The matching desktop entry.
-    pub entry: DesktopEntry,
+    /// The matching launcher entry (application or custom action).
+    pub entry: LauncherEntry,
     /// Score computed by fuzzy matcher (higher is better).
     pub score: u32,
-    /// Character indices in `entry.name` (or haystack) that matched the query, for UI highlighting.
+    /// Character indices in haystack that matched the query, for UI highlighting.
     pub matched_indices: Vec<u32>,
 }
 
-/// High-performance fuzzy matching engine wrapping `nucleo::Nucleo`.
+/// High-performance fuzzy matching engine wrapping `nucleo::Nucleo<LauncherEntry>`.
 pub struct SearchMatcher {
-    nucleo: Nucleo<DesktopEntry>,
+    nucleo: Nucleo<LauncherEntry>,
     matcher: Matcher,
     current_query: String,
     total_items: usize,
@@ -37,15 +37,15 @@ impl SearchMatcher {
         }
     }
 
-    /// Creates a `SearchMatcher` populated with the given desktop entries.
-    pub fn from_entries(entries: Vec<DesktopEntry>) -> Self {
+    /// Creates a `SearchMatcher` populated with the given launcher entries.
+    pub fn from_entries(entries: Vec<LauncherEntry>) -> Self {
         let mut matcher = Self::new();
         matcher.reload(entries);
         matcher
     }
 
-    /// Reloads the matcher with a fresh set of desktop entries.
-    pub fn reload(&mut self, entries: Vec<DesktopEntry>) {
+    /// Reloads the matcher with a fresh set of launcher entries.
+    pub fn reload(&mut self, entries: Vec<LauncherEntry>) {
         self.nucleo.restart(true);
         let injector = self.nucleo.injector();
         self.total_items = entries.len();
@@ -141,32 +141,29 @@ impl Default for SearchMatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use crate::entry::LauncherAction;
 
-    fn make_test_entry(id: &str, name: &str, exec: &str, keywords: Vec<&str>) -> DesktopEntry {
-        let kw: Vec<String> = keywords.into_iter().map(|s| s.to_string()).collect();
-        let search_haystack = format!("{} {} {}", name, exec, kw.join(" "));
-        DesktopEntry {
-            id: id.to_string(),
-            name: name.to_string(),
-            exec: exec.to_string(),
-            icon: Some(id.to_string()),
-            comment: None,
-            generic_name: None,
-            categories: vec![],
-            keywords: kw,
-            path: PathBuf::from(format!("/usr/share/applications/{}.desktop", id)),
-            terminal: false,
-            search_haystack,
-        }
+    fn make_test_entry(id: &str, name: &str, aliases: Vec<&str>) -> LauncherEntry {
+        let al: Vec<String> = aliases.into_iter().map(|s| s.to_string()).collect();
+        LauncherEntry::custom_action(
+            id,
+            name,
+            Some(id.to_string()),
+            Some(format!("Run {name}")),
+            al,
+            LauncherAction::Exec {
+                command: id.to_string(),
+                terminal: false,
+            },
+        )
     }
 
     #[test]
     fn test_search_matcher_ranking() {
         let entries = vec![
-            make_test_entry("term", "GNOME Terminal", "gnome-terminal", vec!["shell", "command"]),
-            make_test_entry("code", "Visual Studio Code", "code", vec!["editor", "development"]),
-            make_test_entry("calc", "Calculator", "gnome-calculator", vec!["math"]),
+            make_test_entry("term", "GNOME Terminal", vec!["shell", "command"]),
+            make_test_entry("code", "Visual Studio Code", vec!["editor", "development"]),
+            make_test_entry("poweroff", "Power Off", vec!["shutdown", "turn off"]),
         ];
 
         let mut matcher = SearchMatcher::from_entries(entries);
@@ -180,11 +177,13 @@ mod tests {
         assert!(results[0].score > 0);
         assert!(!results[0].matched_indices.is_empty());
 
-        // Search "code"
-        matcher.update_query("code");
+        // Search by alias: "shutdown" should rank "poweroff" first!
+        matcher.update_query("shutdown");
         matcher.tick(50);
         let results = matcher.results(10);
-        assert_eq!(results[0].entry.id, "code");
+        assert!(!results.is_empty());
+        assert_eq!(results[0].entry.id, "poweroff");
+        assert_eq!(results[0].entry.name, "Power Off");
 
         // Search non-existent
         matcher.update_query("xyz999nonsense");
@@ -195,13 +194,13 @@ mod tests {
 
     #[test]
     fn test_search_matcher_reload() {
-        let entries = vec![make_test_entry("one", "App One", "app1", vec![])];
+        let entries = vec![make_test_entry("one", "App One", vec![])];
         let mut matcher = SearchMatcher::from_entries(entries);
         assert_eq!(matcher.item_count(), 1);
 
         let new_entries = vec![
-            make_test_entry("two", "App Two", "app2", vec![]),
-            make_test_entry("three", "App Three", "app3", vec![]),
+            make_test_entry("two", "App Two", vec![]),
+            make_test_entry("three", "App Three", vec![]),
         ];
         matcher.reload(new_entries);
         assert_eq!(matcher.item_count(), 2);

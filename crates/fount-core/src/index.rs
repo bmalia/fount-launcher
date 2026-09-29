@@ -1,71 +1,108 @@
-use crate::desktop_entry::{scan_desktop_entries, scan_desktop_entries_in_dirs, DesktopEntry};
+use crate::desktop_entry::{scan_desktop_entries, scan_desktop_entries_in_dirs};
+use crate::entry::{default_system_actions, LauncherEntry};
 use crate::matcher::{SearchMatcher, SearchResult};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-/// Catalog storing in-memory indexed desktop entries and managing the fuzzy search matcher.
+/// Catalog storing in-memory indexed launcher entries (desktop apps + custom actions)
+/// and managing the fuzzy search matcher.
 pub struct IndexCatalog {
-    entries: Vec<DesktopEntry>,
+    entries: Vec<LauncherEntry>,
+    custom_entries: Vec<LauncherEntry>,
     by_id: HashMap<String, usize>,
     matcher: SearchMatcher,
     custom_dirs: Option<Vec<PathBuf>>,
+    include_system_actions: bool,
 }
 
 impl IndexCatalog {
-    /// Creates a new catalog and immediately scans standard XDG application directories.
+    /// Creates a new catalog, immediately scanning standard XDG application directories.
     pub fn new() -> Self {
         let mut catalog = Self {
             entries: Vec::new(),
+            custom_entries: Vec::new(),
             by_id: HashMap::new(),
             matcher: SearchMatcher::new(),
             custom_dirs: None,
+            include_system_actions: false,
         };
         catalog.reload();
         catalog
     }
 
-    /// Creates a catalog that scans specified custom directories instead of system defaults.
+    /// Creates a catalog scanning specified custom directories instead of system defaults.
     pub fn with_dirs(dirs: Vec<PathBuf>) -> Self {
         let mut catalog = Self {
             entries: Vec::new(),
+            custom_entries: Vec::new(),
             by_id: HashMap::new(),
             matcher: SearchMatcher::new(),
             custom_dirs: Some(dirs),
+            include_system_actions: false,
         };
         catalog.reload();
         catalog
     }
 
-    /// Reloads all desktop applications from disk into the catalog and matcher.
-    /// Returns the number of loaded applications.
+    /// Enables or disables inclusion of default system actions (Power Off, Restart, Lock, etc.).
+    pub fn set_include_system_actions(&mut self, include: bool) -> usize {
+        self.include_system_actions = include;
+        self.reload()
+    }
+
+    /// Adds a custom action to the catalog and refreshes the search index.
+    pub fn add_custom_entry(&mut self, entry: LauncherEntry) -> usize {
+        self.custom_entries.push(entry);
+        self.reload()
+    }
+
+    /// Adds multiple custom actions to the catalog and refreshes the search index.
+    pub fn add_custom_entries(&mut self, entries: Vec<LauncherEntry>) -> usize {
+        self.custom_entries.extend(entries);
+        self.reload()
+    }
+
+    /// Reloads all desktop applications from disk and merges with custom and system actions.
+    /// Returns the total number of indexed entries.
     pub fn reload(&mut self) -> usize {
         let scanned = match &self.custom_dirs {
             Some(dirs) => scan_desktop_entries_in_dirs(dirs),
             None => scan_desktop_entries(),
         };
 
+        let mut all_entries: Vec<LauncherEntry> = scanned
+            .into_iter()
+            .map(LauncherEntry::from_desktop_entry)
+            .collect();
+
+        if self.include_system_actions {
+            all_entries.extend(default_system_actions());
+        }
+
+        all_entries.extend(self.custom_entries.clone());
+
         self.by_id.clear();
-        for (idx, entry) in scanned.iter().enumerate() {
+        for (idx, entry) in all_entries.iter().enumerate() {
             self.by_id.insert(entry.id.clone(), idx);
         }
 
-        self.matcher.reload(scanned.clone());
-        self.entries = scanned;
+        self.matcher.reload(all_entries.clone());
+        self.entries = all_entries;
         self.entries.len()
     }
 
-    /// Finds an entry by its desktop file ID.
-    pub fn get_by_id(&self, id: &str) -> Option<&DesktopEntry> {
+    /// Finds an entry by its ID.
+    pub fn get_by_id(&self, id: &str) -> Option<&LauncherEntry> {
         let &idx = self.by_id.get(id)?;
         self.entries.get(idx)
     }
 
-    /// Returns a slice of all indexed desktop entries.
-    pub fn entries(&self) -> &[DesktopEntry] {
+    /// Returns a slice of all indexed launcher entries.
+    pub fn entries(&self) -> &[LauncherEntry] {
         &self.entries
     }
 
-    /// Total count of indexed applications.
+    /// Total count of indexed entries.
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -100,6 +137,7 @@ impl Default for IndexCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::entry::LauncherAction;
     use std::fs;
     use tempfile::tempdir;
 
@@ -166,20 +204,78 @@ Exec=gnome-terminal
     }
 
     #[test]
+    fn test_catalog_with_custom_and_system_actions() {
+        let temp = tempdir().unwrap();
+        let apps_dir = temp.path().join("applications");
+        fs::create_dir_all(&apps_dir).unwrap();
+
+        fs::write(
+            apps_dir.join("calc.desktop"),
+            r#"
+[Desktop Entry]
+Type=Application
+Name=Calculator
+Exec=calc
+"#,
+        )
+        .unwrap();
+
+        let mut catalog = IndexCatalog::with_dirs(vec![apps_dir]);
+        assert_eq!(catalog.len(), 1);
+
+        // Add custom action
+        catalog.add_custom_entry(LauncherEntry::custom_action(
+            "action:screenshot",
+            "Take Screenshot",
+            Some("camera-photo".into()),
+            Some("Capture the screen".into()),
+            vec!["screenshot".into(), "screen cap".into(), "snip".into()],
+            LauncherAction::Command {
+                program: "grim".into(),
+                args: vec![],
+                terminal: false,
+            },
+        ));
+        assert_eq!(catalog.len(), 2);
+
+        // Enable default system actions (5 actions)
+        catalog.set_include_system_actions(true);
+        assert_eq!(catalog.len(), 7);
+
+        // Search for "shutdown" -> should find Power Off
+        catalog.search("shutdown");
+        catalog.tick(50);
+        let results = catalog.results(5);
+        assert!(!results.is_empty());
+        assert_eq!(results[0].entry.id, "action:poweroff");
+        assert_eq!(results[0].entry.name, "Power Off");
+
+        // Search for "snip" -> should find Screenshot custom action
+        catalog.search("snip");
+        catalog.tick(50);
+        let results = catalog.results(5);
+        assert!(!results.is_empty());
+        assert_eq!(results[0].entry.id, "action:screenshot");
+    }
+
+    #[test]
     fn test_live_system_scan() {
         let entries = crate::desktop_entry::scan_desktop_entries();
         println!("Scanned {} live desktop applications on host system", entries.len());
         assert!(!entries.is_empty(), "Should find desktop applications on a Linux host");
 
         let mut catalog = IndexCatalog::new();
+        catalog.set_include_system_actions(true);
         assert!(!catalog.is_empty());
 
-        catalog.search("sh");
+        // Search for "power"
+        catalog.search("power");
         catalog.tick(50);
         let results = catalog.results(5);
-        println!("Search 'sh' found {} matches:", results.len());
+        println!("Search 'power' found {} matches:", results.len());
         for res in &results {
-            println!(" - {} (exec: {}, score: {})", res.entry.name, res.entry.exec, res.score);
+            println!(" - {} (id: {}, score: {})", res.entry.name, res.entry.id, res.score);
         }
+        assert!(results.iter().any(|r| r.entry.id == "action:poweroff"));
     }
 }
