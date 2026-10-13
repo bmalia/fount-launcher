@@ -108,7 +108,7 @@ impl SearchMatcher {
                     score = s;
                     matched_indices.sort_unstable();
                     matched_indices.dedup();
-                }
+                };
             }
 
             results.push(SearchResult {

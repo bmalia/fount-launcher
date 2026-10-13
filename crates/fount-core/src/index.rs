@@ -1,5 +1,6 @@
+use crate::config_manager::LauncherConfig;
 use crate::desktop_entry::{scan_desktop_entries, scan_desktop_entries_in_dirs};
-use crate::entry::{default_system_actions, LauncherEntry};
+use crate::entry::{LauncherEntry, default_system_actions};
 use crate::matcher::{SearchMatcher, SearchResult};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -42,6 +43,38 @@ impl IndexCatalog {
         };
         catalog.reload();
         catalog
+    }
+
+    /// Creates a catalog initialized with the given `LauncherConfig`.
+    pub fn with_config(config: LauncherConfig) -> Self {
+        let custom_entries = config.to_launcher_entries();
+        let custom_dirs = if config.custom_dirs.is_empty() {
+            None
+        } else {
+            Some(config.custom_dirs)
+        };
+        let mut catalog = Self {
+            entries: Vec::new(),
+            custom_entries,
+            by_id: HashMap::new(),
+            matcher: SearchMatcher::new(),
+            custom_dirs,
+            include_system_actions: config.include_system_actions,
+        };
+        catalog.reload();
+        catalog
+    }
+
+    /// Updates catalog configuration and reloads indexed entries.
+    pub fn apply_config(&mut self, config: LauncherConfig) -> usize {
+        self.custom_entries = config.to_launcher_entries();
+        self.custom_dirs = if config.custom_dirs.is_empty() {
+            None
+        } else {
+            Some(config.custom_dirs)
+        };
+        self.include_system_actions = config.include_system_actions;
+        self.reload()
     }
 
     /// Enables or disables inclusion of default system actions (Power Off, Restart, Lock, etc.).
@@ -137,6 +170,7 @@ impl Default for IndexCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config_manager::ConfigManager;
     use crate::entry::LauncherAction;
     use std::fs;
     use tempfile::tempdir;
@@ -259,10 +293,54 @@ Exec=calc
     }
 
     #[test]
+    fn test_catalog_with_config() {
+        let temp = tempdir().unwrap();
+        let apps_dir = temp.path().join("applications");
+        fs::create_dir_all(&apps_dir).unwrap();
+
+        let json = format!(
+            r#"{{
+            "custom_dirs": ["{}"],
+            "include_system_actions": true,
+            "custom_actions": [
+                {{
+                    "id": "action:notes",
+                    "name": "Quick Notes",
+                    "aliases": ["memo", "scratchpad"],
+                    "action": {{
+                        "type": "shell",
+                        "script": "nvim ~/notes.txt"
+                    }}
+                }}
+            ]
+        }}"#,
+            apps_dir.display()
+        );
+
+        let config = ConfigManager::load_from_str(&json).unwrap();
+        let mut catalog = IndexCatalog::with_config(config);
+        assert!(catalog.get_by_id("action:notes").is_some());
+        assert!(catalog.get_by_id("action:poweroff").is_some());
+
+        // Test search for the custom action from config
+        catalog.search("scratchpad");
+        catalog.tick(50);
+        let results = catalog.results(5);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].entry.id, "action:notes");
+    }
+
+    #[test]
     fn test_live_system_scan() {
         let entries = crate::desktop_entry::scan_desktop_entries();
-        println!("Scanned {} live desktop applications on host system", entries.len());
-        assert!(!entries.is_empty(), "Should find desktop applications on a Linux host");
+        println!(
+            "Scanned {} live desktop applications on host system",
+            entries.len()
+        );
+        assert!(
+            !entries.is_empty(),
+            "Should find desktop applications on a Linux host"
+        );
 
         let mut catalog = IndexCatalog::new();
         catalog.set_include_system_actions(true);
@@ -274,7 +352,10 @@ Exec=calc
         let results = catalog.results(5);
         println!("Search 'power' found {} matches:", results.len());
         for res in &results {
-            println!(" - {} (id: {}, score: {})", res.entry.name, res.entry.id, res.score);
+            println!(
+                " - {} (id: {}, score: {})",
+                res.entry.name, res.entry.id, res.score
+            );
         }
         assert!(results.iter().any(|r| r.entry.id == "action:poweroff"));
     }

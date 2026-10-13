@@ -9,6 +9,7 @@ freedesktop-desktop-entry = "0.8.3"
 serde = { version = "1.0.229", features = ["derive"] }
 walkdir = "2.5.0"
 thiserror = "2.0.21"
+config = { version = "0.15.26", features = ["json"] }
 
 [dev-dependencies]
 tempfile = "3.17"
