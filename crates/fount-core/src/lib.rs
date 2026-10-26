@@ -1,7 +1,7 @@
 //! `fount-core`: Fast, pure synchronous desktop search and indexing library.
 //!
 //! Provides XDG desktop file scanning, parsing, custom action definitions, in-memory cataloging,
-//! and fuzzy ranking via `nucleo`. Strictly free of any async runtime, D-Bus, or network dependencies.
+//! and fuzzy ranking via `nucleo`.
 
 pub mod config_manager;
 pub mod desktop_entry;
@@ -16,6 +16,6 @@ pub use desktop_entry::{
     scan_desktop_entries_in_dirs,
 };
 pub use entry::{EntryKind, LauncherAction, LauncherEntry, default_system_actions};
-pub use frecency::{default_frecency_path, EntryStats, FrecencyStore};
+pub use frecency::{EntryStats, FrecencyStore, default_frecency_path};
 pub use index::IndexCatalog;
 pub use matcher::{SearchMatcher, SearchResult};
