@@ -1,6 +1,7 @@
 use crate::config_manager::LauncherConfig;
 use crate::desktop_entry::{scan_desktop_entries, scan_desktop_entries_in_dirs};
-use crate::entry::{LauncherEntry, default_system_actions};
+use crate::entry::{default_system_actions, LauncherEntry};
+use crate::frecency::{current_unix_timestamp, FrecencyStore};
 use crate::matcher::{SearchMatcher, SearchResult};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -14,6 +15,7 @@ pub struct IndexCatalog {
     matcher: SearchMatcher,
     custom_dirs: Option<Vec<PathBuf>>,
     include_system_actions: bool,
+    frecency: FrecencyStore,
 }
 
 impl IndexCatalog {
@@ -26,6 +28,7 @@ impl IndexCatalog {
             matcher: SearchMatcher::new(),
             custom_dirs: None,
             include_system_actions: false,
+            frecency: FrecencyStore::open_default(),
         };
         catalog.reload();
         catalog
@@ -40,6 +43,7 @@ impl IndexCatalog {
             matcher: SearchMatcher::new(),
             custom_dirs: Some(dirs),
             include_system_actions: false,
+            frecency: FrecencyStore::open_default(),
         };
         catalog.reload();
         catalog
@@ -60,6 +64,7 @@ impl IndexCatalog {
             matcher: SearchMatcher::new(),
             custom_dirs,
             include_system_actions: config.include_system_actions,
+            frecency: FrecencyStore::open_default(),
         };
         catalog.reload();
         catalog
@@ -155,9 +160,36 @@ impl IndexCatalog {
         self.matcher.tick(timeout_ms)
     }
 
-    /// Retrieves up to `limit` ranked search results.
+    /// Retrieves up to `limit` ranked search results, applying frecency boosting.
     pub fn results(&mut self, limit: usize) -> Vec<SearchResult> {
-        self.matcher.results(limit)
+        let now = current_unix_timestamp();
+        self.matcher
+            .results_with_frecency(limit, |id| self.frecency.get_score(id, now))
+    }
+
+    /// Returns a reference to the frecency store.
+    pub fn frecency(&self) -> &FrecencyStore {
+        &self.frecency
+    }
+
+    /// Returns a mutable reference to the frecency store.
+    pub fn frecency_mut(&mut self) -> &mut FrecencyStore {
+        &mut self.frecency
+    }
+
+    /// Replaces the frecency store (useful for tests or custom paths).
+    pub fn set_frecency_store(&mut self, store: FrecencyStore) {
+        self.frecency = store;
+    }
+
+    /// Records a launch event for the specified entry ID, boosting its future ranking.
+    pub fn record_launch(&mut self, id: &str) -> f32 {
+        self.frecency.record_launch(id)
+    }
+
+    /// Persists the frecency state to disk atomically.
+    pub fn save_frecency(&self) -> std::io::Result<()> {
+        self.frecency.save()
     }
 }
 
@@ -358,5 +390,59 @@ Exec=calc
             );
         }
         assert!(results.iter().any(|r| r.entry.id == "action:poweroff"));
+    }
+
+    #[test]
+    fn test_catalog_frecency_integration() {
+        let temp = tempdir().unwrap();
+        let apps_dir = temp.path().join("applications");
+        let frecency_file = temp.path().join("frecency.bin");
+        fs::create_dir_all(&apps_dir).unwrap();
+
+        fs::write(
+            apps_dir.join("calc.desktop"),
+            r#"
+[Desktop Entry]
+Type=Application
+Name=Calculator
+Exec=calc
+"#,
+        )
+        .unwrap();
+
+        fs::write(
+            apps_dir.join("calendar.desktop"),
+            r#"
+[Desktop Entry]
+Type=Application
+Name=Calendar
+Exec=calendar
+"#,
+        )
+        .unwrap();
+
+        let mut catalog = IndexCatalog::with_dirs(vec![apps_dir]);
+        catalog.set_frecency_store(FrecencyStore::open_or_create(frecency_file.clone()));
+        assert_eq!(catalog.len(), 2);
+
+        // Record launch for calendar 5 times
+        for _ in 0..5 {
+            catalog.record_launch("calendar.desktop");
+        }
+        catalog.save_frecency().unwrap();
+        assert!(frecency_file.is_file());
+
+        // Empty query search should return Calendar as #1 because of frecency
+        catalog.search("");
+        catalog.tick(50);
+        let results = catalog.results(2);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].entry.id, "calendar.desktop");
+
+        // Search "cal": both match "cal", but Calendar has higher frecency score
+        catalog.search("cal");
+        catalog.tick(50);
+        let results = catalog.results(2);
+        assert_eq!(results[0].entry.id, "calendar.desktop");
     }
 }

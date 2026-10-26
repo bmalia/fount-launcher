@@ -87,37 +87,80 @@ impl SearchMatcher {
 
     /// Extracts the top `limit` ranked results from the current snapshot.
     pub fn results(&mut self, limit: usize) -> Vec<SearchResult> {
+        self.results_with_frecency(limit, |_| 0.0)
+    }
+
+    /// Extracts the top `limit` ranked results, combining fuzzy scoring with a frecency bonus.
+    ///
+    /// When the query is empty, results are ordered purely by frecency score descending.
+    /// When the query is non-empty, candidates are boosted: `score * (1.0 + 0.15 * ln(1.0 + frecency))`.
+    pub fn results_with_frecency(
+        &mut self,
+        limit: usize,
+        frecency_fn: impl Fn(&str) -> f32,
+    ) -> Vec<SearchResult> {
         let snap = self.nucleo.snapshot();
         let total_matched = snap.matched_item_count() as usize;
-        let fetch_count = (limit.min(total_matched)) as u32;
 
-        let mut results = Vec::with_capacity(fetch_count as usize);
+        if total_matched == 0 {
+            return Vec::new();
+        }
 
-        for item in snap.matched_items(0..fetch_count) {
+        // When query is empty, return top entries sorted by frecency score
+        if self.current_query.is_empty() {
+            let mut candidates: Vec<(LauncherEntry, f32)> = Vec::with_capacity(total_matched);
+            for item in snap.matched_items(0..total_matched as u32) {
+                let f_score = frecency_fn(&item.data.id);
+                candidates.push((item.data.clone(), f_score));
+            }
+            candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            candidates.truncate(limit);
+            return candidates
+                .into_iter()
+                .map(|(entry, score)| SearchResult {
+                    entry,
+                    score: score.round() as u32,
+                    matched_indices: Vec::new(),
+                })
+                .collect();
+        }
+
+        // Pool candidate matches from Nucleo snapshot
+        let pool_size = (limit * 4).max(64).min(total_matched) as u32;
+        let mut results = Vec::with_capacity(pool_size as usize);
+
+        for item in snap.matched_items(0..pool_size) {
             let mut matched_indices = Vec::new();
             let mut score = 0;
 
-            if !self.current_query.is_empty() {
-                // Compute score and matched indices on haystack
-                let pattern = snap.pattern().column_pattern(0);
-                if let Some(s) = pattern.indices(
-                    item.matcher_columns[0].slice(..),
-                    &mut self.matcher,
-                    &mut matched_indices,
-                ) {
-                    score = s;
-                    matched_indices.sort_unstable();
-                    matched_indices.dedup();
-                };
+            let pattern = snap.pattern().column_pattern(0);
+            if let Some(s) = pattern.indices(
+                item.matcher_columns[0].slice(..),
+                &mut self.matcher,
+                &mut matched_indices,
+            ) {
+                score = s;
+                matched_indices.sort_unstable();
+                matched_indices.dedup();
             }
+
+            let frecency = frecency_fn(&item.data.id);
+            let final_score = if frecency > 0.0 && score > 0 {
+                (score as f32 * (1.0 + 0.15 * (1.0 + frecency).ln())).round() as u32
+            } else {
+                score
+            };
 
             results.push(SearchResult {
                 entry: item.data.clone(),
-                score,
+                score: final_score,
                 matched_indices,
             });
         }
 
+        // Re-sort candidate pool with blended scores
+        results.sort_by_key(|a| std::cmp::Reverse(a.score));
+        results.truncate(limit);
         results
     }
 
@@ -210,5 +253,36 @@ mod tests {
         let results = matcher.results(10);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].entry.id, "three");
+    }
+
+    #[test]
+    fn test_frecency_ranking_and_empty_query() {
+        let entries = vec![
+            make_test_entry("gimp", "GNU Image Manipulation Program", vec!["gimp"]),
+            make_test_entry("git-gui", "Git GUI", vec!["git"]),
+            make_test_entry("calc", "Calculator", vec!["calc"]),
+        ];
+        let mut matcher = SearchMatcher::from_entries(entries);
+
+        // Simulated frecency table: "git-gui" is heavily used, "gimp" is rarely used, "calc" is unused
+        let frecency_map = std::collections::HashMap::from([
+            ("git-gui".to_string(), 500.0),
+            ("gimp".to_string(), 50.0),
+        ]);
+        let frecency_fn = |id: &str| *frecency_map.get(id).unwrap_or(&0.0);
+
+        // 1. Empty query should return entries sorted by frecency score: git-gui first, then gimp
+        matcher.update_query("");
+        matcher.tick(50);
+        let empty_results = matcher.results_with_frecency(5, frecency_fn);
+        assert_eq!(empty_results.len(), 3);
+        assert_eq!(empty_results[0].entry.id, "git-gui");
+        assert_eq!(empty_results[1].entry.id, "gimp");
+
+        // 2. Query "gi": both match "gi", but git-gui's frecency boosts it to #1
+        matcher.update_query("gi");
+        matcher.tick(50);
+        let search_results = matcher.results_with_frecency(5, frecency_fn);
+        assert_eq!(search_results[0].entry.id, "git-gui");
     }
 }

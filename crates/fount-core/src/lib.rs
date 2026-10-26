@@ -6,6 +6,7 @@
 pub mod config_manager;
 pub mod desktop_entry;
 pub mod entry;
+pub mod frecency;
 pub mod index;
 pub mod matcher;
 
@@ -15,5 +16,6 @@ pub use desktop_entry::{
     scan_desktop_entries_in_dirs,
 };
 pub use entry::{EntryKind, LauncherAction, LauncherEntry, default_system_actions};
+pub use frecency::{default_frecency_path, EntryStats, FrecencyStore};
 pub use index::IndexCatalog;
 pub use matcher::{SearchMatcher, SearchResult};
