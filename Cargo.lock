@@ -454,7 +454,7 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "fount-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bincode",
  "config",
@@ -467,12 +467,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "fount-core"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33b374a485f856a21b2a5548691856f59615516e9ddf8eeeca8c091fc0408817"
+dependencies = [
+ "bincode",
+ "config",
+ "freedesktop-desktop-entry",
+ "nucleo",
+ "serde",
+ "thiserror",
+ "walkdir",
+]
+
+[[package]]
 name = "fount-daemon"
 version = "0.1.0"
 dependencies = [
  "bincode",
  "bytes",
- "fount-core",
+ "fount-core 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde",
  "serde_json",
  "tempfile",

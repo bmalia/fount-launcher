@@ -2,9 +2,13 @@
 name = "fount-daemon"
 version = "0.1.0"
 edition = "2024"
+description = "A lightweight application launcher backend for Linux"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/bmalia/fount-launcher"
+readme = "../../README.md"
 
 [dependencies]
-fount-core = { path = "../fount-core" }
+fount-core = "0.1.1"
 tokio = { version = "1.0", features = ["full"] }
 zbus = "5.19.0"
 serde = { version = "1.0.229", features = ["derive"] }
