@@ -1,5 +1,5 @@
 use crate::protocol::{ClientMessage, DaemonMessage, SearchResultWire};
-use fount_core::{IndexCatalog, LauncherConfig, SearchResult};
+use fount_core::{IndexCatalog, SearchResult};
 use std::thread;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
@@ -41,9 +41,10 @@ pub struct EngineHandle {
 }
 
 impl EngineHandle {
-    /// Spawns the dedicated OS actor thread initialized with the default `LauncherConfig`.
+    /// Spawns the dedicated OS actor thread initialized from `$XDG_CONFIG_HOME/fount/config.json`
+    /// (or `~/.config/fount/config.json`, falling back to defaults if not present).
     pub fn spawn() -> Self {
-        let catalog = IndexCatalog::with_config(LauncherConfig::default());
+        let catalog = IndexCatalog::from_default_config();
         Self::spawn_with_catalog(catalog)
     }
 

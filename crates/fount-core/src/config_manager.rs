@@ -77,12 +77,14 @@ impl From<CustomEntryConfig> for LauncherEntry {
 }
 
 /// Top-level configuration object.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LauncherConfig {
     #[serde(default)]
     pub custom_dirs: Vec<PathBuf>,
     #[serde(default = "default_true")]
     pub include_system_actions: bool,
+    #[serde(default = "default_min_score_ratio")]
+    pub min_score_ratio: f32,
     #[serde(default)]
     pub custom_actions: Vec<CustomEntryConfig>,
 }
@@ -91,11 +93,17 @@ fn default_true() -> bool {
     true
 }
 
+/// Default relative score cutoff (65% of the top match's raw fuzzy score).
+pub fn default_min_score_ratio() -> f32 {
+    0.65
+}
+
 impl Default for LauncherConfig {
     fn default() -> Self {
         Self {
             custom_dirs: Vec::new(),
             include_system_actions: true,
+            min_score_ratio: default_min_score_ratio(),
             custom_actions: Vec::new(),
         }
     }
@@ -112,13 +120,39 @@ impl LauncherConfig {
     }
 }
 
+/// Resolves the standard XDG config path: `$XDG_CONFIG_HOME/fount/config.json`
+/// (falling back to `~/.config/fount/config.json`).
+pub fn default_config_path() -> PathBuf {
+    if let Ok(config_home) = std::env::var("XDG_CONFIG_HOME")
+        && !config_home.is_empty()
+    {
+        return PathBuf::from(config_home).join("fount").join("config.json");
+    }
+    if let Ok(home) = std::env::var("HOME")
+        && !home.is_empty()
+    {
+        return PathBuf::from(home)
+            .join(".config")
+            .join("fount")
+            .join("config.json");
+    }
+    PathBuf::from("/etc/fount/config.json")
+}
+
 pub struct ConfigManager;
 
 impl ConfigManager {
+    /// Loads configuration from `$XDG_CONFIG_HOME/fount/config.json` (or `~/.config/fount/config.json`).
+    /// If the file does not exist or fails to parse, falls back to `LauncherConfig::default()`.
+    pub fn load_default() -> Result<LauncherConfig, ConfigError> {
+        Self::load_from_file(default_config_path())
+    }
+
     /// Loads configuration from an optional file path or string content.
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<LauncherConfig, ConfigError> {
         let builder = Config::builder()
             .set_default("include_system_actions", true)?
+            .set_default("min_score_ratio", f64::from(default_min_score_ratio()))?
             .set_default("custom_dirs", Vec::<String>::new())?
             .set_default("custom_actions", Vec::<String>::new())?
             .add_source(
@@ -135,6 +169,7 @@ impl ConfigManager {
     pub fn load_from_str(json_str: &str) -> Result<LauncherConfig, ConfigError> {
         let builder = Config::builder()
             .set_default("include_system_actions", true)?
+            .set_default("min_score_ratio", f64::from(default_min_score_ratio()))?
             .set_default("custom_dirs", Vec::<String>::new())?
             .set_default("custom_actions", Vec::<String>::new())?
             .add_source(File::from_str(json_str, FileFormat::Json));

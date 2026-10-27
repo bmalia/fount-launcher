@@ -1,5 +1,5 @@
-use fount_daemon::EngineHandle;
-use tracing::info;
+use fount_daemon::{EngineHandle, default_socket_path, run_unix_socket_server};
+use tracing::{error, info};
 
 #[tokio::main(worker_threads = 2)]
 async fn main() {
@@ -7,12 +7,27 @@ async fn main() {
 
     info!("Starting Fount search daemon...");
     let engine = EngineHandle::spawn();
+    let socket_path = default_socket_path();
 
-    info!("Engine actor running. Waiting for shutdown signal (Ctrl+C)...");
-    if let Err(e) = tokio::signal::ctrl_c().await {
-        tracing::error!(error = %e, "Failed to listen for Ctrl+C signal");
+    let server_engine = engine.clone();
+    let server_socket_path = socket_path.clone();
+
+    tokio::select! {
+        res = run_unix_socket_server(server_socket_path, server_engine) => {
+            if let Err(e) = res {
+                error!(error = %e, "Unix domain socket server terminated with error");
+            }
+        }
+        sig = tokio::signal::ctrl_c() => {
+            if let Err(e) = sig {
+                error!(error = %e, "Failed to listen for Ctrl+C signal");
+            } else {
+                info!("Received Ctrl+C shutdown signal");
+            }
+        }
     }
 
+    let _ = std::fs::remove_file(&socket_path);
     let _ = engine.shutdown().await;
-    info!("Shutdown cleanly. Exiting.");
+    info!("Fount daemon stopped cleanly.");
 }

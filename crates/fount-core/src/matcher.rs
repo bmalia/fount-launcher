@@ -1,8 +1,19 @@
-use crate::entry::LauncherEntry;
-use nucleo::pattern::{CaseMatching, Normalization};
+use crate::config_manager::default_min_score_ratio;
+use crate::entry::{LauncherAction, LauncherEntry};
+use nucleo::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo::{Config, Matcher, Nucleo, Utf32String};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+
+/// Minimum raw score per query character for multi-character queries.
+/// Contiguous matches in Nucleo earn ~32 points/char; scattered gap matches earn ~12-16 points/char.
+const MIN_SCORE_PER_CHAR: u32 = 18;
+
+/// Field weight multipliers ensuring title matches outrank alias/command/description matches.
+const WEIGHT_NAME: f32 = 1.0;
+const WEIGHT_ALIAS: f32 = 0.85;
+const WEIGHT_COMMAND: f32 = 0.80;
+const WEIGHT_DESCRIPTION: f32 = 0.60;
 
 /// A ranked search result containing the matched launcher entry, match score, and character indices.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -11,7 +22,7 @@ pub struct SearchResult {
     pub entry: LauncherEntry,
     /// Score computed by fuzzy matcher (higher is better).
     pub score: u32,
-    /// Character indices in haystack that matched the query, for UI highlighting.
+    /// Character indices in `entry.name` that matched the query, for UI highlighting.
     pub matched_indices: Vec<u32>,
 }
 
@@ -21,6 +32,7 @@ pub struct SearchMatcher {
     matcher: Matcher,
     current_query: String,
     total_items: usize,
+    min_score_ratio: f32,
 }
 
 impl SearchMatcher {
@@ -34,6 +46,7 @@ impl SearchMatcher {
             matcher,
             current_query: String::new(),
             total_items: 0,
+            min_score_ratio: default_min_score_ratio(),
         }
     }
 
@@ -42,6 +55,17 @@ impl SearchMatcher {
         let mut matcher = Self::new();
         matcher.reload(entries);
         matcher
+    }
+
+    /// Sets the relative score threshold ratio (clamped to `0.0..=1.0`).
+    /// Candidates with a raw fuzzy score below `top_raw_score * min_score_ratio` are filtered out.
+    pub fn set_min_score_ratio(&mut self, ratio: f32) {
+        self.min_score_ratio = ratio.clamp(0.0, 1.0);
+    }
+
+    /// Returns the configured relative score threshold ratio.
+    pub fn min_score_ratio(&self) -> f32 {
+        self.min_score_ratio
     }
 
     /// Reloads the matcher with a fresh set of launcher entries.
@@ -90,15 +114,24 @@ impl SearchMatcher {
         self.results_with_frecency(limit, |_| 0.0)
     }
 
-    /// Extracts the top `limit` ranked results, combining fuzzy scoring with a frecency bonus.
+    /// Extracts the top `limit` ranked results, combining per-field weighted fuzzy scoring,
+    /// relevance thresholding, and frecency boosting.
     ///
-    /// When the query is empty, results are ordered purely by frecency score descending.
-    /// When the query is non-empty, candidates are boosted: `score * (1.0 + 0.15 * ln(1.0 + frecency))`.
+    /// - When the query is empty, results are ordered purely by frecency score descending.
+    /// - When the query is non-empty:
+    ///   1. Candidates are scored per discrete field (`name`, `aliases`, `action`, `description`)
+    ///      to prevent cross-field false positives.
+    ///   2. Weak matches below `top_raw_score * min_score_ratio` or the per-character floor are dropped.
+    ///   3. Surviving relevant candidates are boosted by frecency: `score * (1.0 + 0.15 * ln(1.0 + frecency))`.
     pub fn results_with_frecency(
         &mut self,
         limit: usize,
         frecency_fn: impl Fn(&str) -> f32,
     ) -> Vec<SearchResult> {
+        if limit == 0 {
+            return Vec::new();
+        }
+
         let snap = self.nucleo.snapshot();
         let total_matched = snap.matched_item_count() as usize;
 
@@ -127,38 +160,56 @@ impl SearchMatcher {
 
         // Pool candidate matches from Nucleo snapshot
         let pool_size = (limit * 4).max(64).min(total_matched) as u32;
-        let mut results = Vec::with_capacity(pool_size as usize);
+        let pattern = snap.pattern().column_pattern(0);
+
+        let mut scored_candidates: Vec<(LauncherEntry, u32, Vec<u32>)> =
+            Vec::with_capacity(pool_size as usize);
+        let mut top_raw_score: u32 = 0;
 
         for item in snap.matched_items(0..pool_size) {
-            let mut matched_indices = Vec::new();
-            let mut score = 0;
+            if let Some((raw_score, matched_indices)) =
+                score_entry_fields(pattern, item.data, &mut self.matcher)
+            {
+                top_raw_score = top_raw_score.max(raw_score);
+                scored_candidates.push((item.data.clone(), raw_score, matched_indices));
+            }
+        }
 
-            let pattern = snap.pattern().column_pattern(0);
-            if let Some(s) = pattern.indices(
-                item.matcher_columns[0].slice(..),
-                &mut self.matcher,
-                &mut matched_indices,
-            ) {
-                score = s;
-                matched_indices.sort_unstable();
-                matched_indices.dedup();
+        if scored_candidates.is_empty() || top_raw_score == 0 {
+            return Vec::new();
+        }
+
+        // Compute minimum relevance cutoff
+        let query_chars = self.current_query.chars().count() as u32;
+        let min_abs_score = if query_chars <= 1 {
+            12
+        } else {
+            (query_chars * MIN_SCORE_PER_CHAR * 60) / 100
+        };
+        let relative_cutoff = (top_raw_score as f32 * self.min_score_ratio).round() as u32;
+        let cutoff = relative_cutoff.max(min_abs_score);
+
+        let mut results = Vec::with_capacity(scored_candidates.len());
+        for (entry, raw_score, matched_indices) in scored_candidates {
+            if raw_score < cutoff {
+                continue;
             }
 
-            let frecency = frecency_fn(&item.data.id);
-            let final_score = if frecency > 0.0 && score > 0 {
-                (score as f32 * (1.0 + 0.15 * (1.0 + frecency).ln())).round() as u32
+            let frecency = frecency_fn(&entry.id);
+            let final_score = if frecency > 0.0 {
+                (raw_score as f32 * (1.0 + 0.15 * (1.0 + frecency).ln())).round() as u32
             } else {
-                score
+                raw_score
             };
 
             results.push(SearchResult {
-                entry: item.data.clone(),
+                entry,
                 score: final_score,
                 matched_indices,
             });
         }
 
-        // Re-sort candidate pool with blended scores
+        // Re-sort surviving relevant candidates with blended scores
         results.sort_by_key(|a| std::cmp::Reverse(a.score));
         results.truncate(limit);
         results
@@ -175,6 +226,71 @@ impl SearchMatcher {
     }
 }
 
+/// Evaluates `pattern` against each individual field of `entry` using field weights.
+///
+/// Prevents false-positive matches where query characters are scattered across different fields
+/// (e.g. matching half of `name` and half of `comment`).
+fn score_entry_fields(
+    pattern: &Pattern,
+    entry: &LauncherEntry,
+    matcher: &mut Matcher,
+) -> Option<(u32, Vec<u32>)> {
+    let mut name_indices = Vec::new();
+    let mut best_score: Option<u32> = None;
+
+    // 1. Primary field: Display Name (weight 1.0)
+    let name_u32 = Utf32String::from(entry.name.as_str());
+    if let Some(s) = pattern.indices(name_u32.slice(..), matcher, &mut name_indices) {
+        name_indices.sort_unstable();
+        name_indices.dedup();
+        let weighted = (s as f32 * WEIGHT_NAME).round() as u32;
+        best_score = Some(weighted.max(1));
+    }
+
+    // 2. Aliases / Keywords / Categories (weight 0.85)
+    for alias in &entry.aliases {
+        let alias_u32 = Utf32String::from(alias.as_str());
+        if let Some(s) = pattern.score(alias_u32.slice(..), matcher) {
+            let weighted = ((s as f32 * WEIGHT_ALIAS).round() as u32).max(1);
+            best_score = Some(best_score.map_or(weighted, |cur| cur.max(weighted)));
+        }
+    }
+
+    // 3. Executable command / action target (weight 0.80)
+    let cmd_str = match &entry.action {
+        LauncherAction::Exec { command, .. } => command.as_str(),
+        LauncherAction::Command { program, .. } => program.as_str(),
+        LauncherAction::Shell(script) => script.as_str(),
+        LauncherAction::Custom(id) => id.as_str(),
+    };
+    let cmd_u32 = Utf32String::from(cmd_str);
+    if let Some(s) = pattern.score(cmd_u32.slice(..), matcher) {
+        let weighted = ((s as f32 * WEIGHT_COMMAND).round() as u32).max(1);
+        best_score = Some(best_score.map_or(weighted, |cur| cur.max(weighted)));
+    }
+
+    // 4. Description / GenericName / Comment (weight 0.60)
+    if let Some(ref desc) = entry.description {
+        let desc_u32 = Utf32String::from(desc.as_str());
+        if let Some(s) = pattern.score(desc_u32.slice(..), matcher) {
+            let weighted = ((s as f32 * WEIGHT_DESCRIPTION).round() as u32).max(1);
+            best_score = Some(best_score.map_or(weighted, |cur| cur.max(weighted)));
+        }
+    }
+
+    if let Some(de) = entry.as_desktop_entry()
+        && let Some(ref comment) = de.comment
+    {
+        let comment_u32 = Utf32String::from(comment.as_str());
+        if let Some(s) = pattern.score(comment_u32.slice(..), matcher) {
+            let weighted = ((s as f32 * WEIGHT_DESCRIPTION).round() as u32).max(1);
+            best_score = Some(best_score.map_or(weighted, |cur| cur.max(weighted)));
+        }
+    }
+
+    best_score.map(|score| (score, name_indices))
+}
+
 impl Default for SearchMatcher {
     fn default() -> Self {
         Self::new()
@@ -184,7 +300,6 @@ impl Default for SearchMatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entry::LauncherAction;
 
     fn make_test_entry(id: &str, name: &str, aliases: Vec<&str>) -> LauncherEntry {
         let al: Vec<String> = aliases.into_iter().map(|s| s.to_string()).collect();
@@ -233,6 +348,55 @@ mod tests {
         matcher.tick(50);
         let results = matcher.results(10);
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_score_threshold_and_cross_field_filtering() {
+        // 1. "Power Off" has an exact prefix match on "power"
+        // 2. "Power Statistics" has an exact prefix match on "power"
+        // 3. "Firefox" has 'p' in description ("Browse pages") and 'o','w','e','r' in "Browser" (cross-field)
+        // 4. "Photo Viewer" has scattered p..o..w..e..r in description ("Picture viewer for raw media")
+        let entries = vec![
+            make_test_entry("poweroff", "Power Off", vec!["shutdown"]),
+            make_test_entry("powerstats", "Power Statistics", vec!["battery"]),
+            LauncherEntry::custom_action(
+                "firefox",
+                "Firefox Web Browser",
+                None,
+                Some("Browse pages on the World Wide Web".into()),
+                vec!["internet".into()],
+                LauncherAction::Exec {
+                    command: "firefox".into(),
+                    terminal: false,
+                },
+            ),
+            LauncherEntry::custom_action(
+                "viewer",
+                "Image Viewer",
+                None,
+                Some("Picture organizer with raw export rendering".into()),
+                vec![],
+                LauncherAction::Exec {
+                    command: "eog".into(),
+                    terminal: false,
+                },
+            ),
+        ];
+
+        let mut matcher = SearchMatcher::from_entries(entries);
+        matcher.update_query("power");
+        matcher.tick(50);
+
+        // Request limit 10, but only the 2 genuinely relevant "Power" entries should be returned!
+        let results = matcher.results(10);
+        assert_eq!(
+            results.len(),
+            2,
+            "Expected only the 2 relevant entries, got: {:?}",
+            results.iter().map(|r| &r.entry.name).collect::<Vec<_>>()
+        );
+        assert_eq!(results[0].entry.id, "poweroff");
+        assert_eq!(results[1].entry.id, "powerstats");
     }
 
     #[test]

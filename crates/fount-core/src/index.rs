@@ -1,7 +1,7 @@
-use crate::config_manager::LauncherConfig;
+use crate::config_manager::{ConfigManager, LauncherConfig, default_config_path};
 use crate::desktop_entry::{scan_desktop_entries, scan_desktop_entries_in_dirs};
-use crate::entry::{default_system_actions, LauncherEntry};
-use crate::frecency::{current_unix_timestamp, FrecencyStore};
+use crate::entry::{LauncherEntry, default_system_actions};
+use crate::frecency::{FrecencyStore, current_unix_timestamp};
 use crate::matcher::{SearchMatcher, SearchResult};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -15,6 +15,7 @@ pub struct IndexCatalog {
     matcher: SearchMatcher,
     custom_dirs: Option<Vec<PathBuf>>,
     include_system_actions: bool,
+    config_path: Option<PathBuf>,
     frecency: FrecencyStore,
 }
 
@@ -28,6 +29,7 @@ impl IndexCatalog {
             matcher: SearchMatcher::new(),
             custom_dirs: None,
             include_system_actions: false,
+            config_path: None,
             frecency: FrecencyStore::open_default(),
         };
         catalog.reload();
@@ -43,9 +45,25 @@ impl IndexCatalog {
             matcher: SearchMatcher::new(),
             custom_dirs: Some(dirs),
             include_system_actions: false,
+            config_path: None,
             frecency: FrecencyStore::open_default(),
         };
         catalog.reload();
+        catalog
+    }
+
+    /// Creates a catalog backed by `$XDG_CONFIG_HOME/fount/config.json` (or `~/.config/fount/config.json`).
+    /// Calling `reload()` on this catalog will also hot-reload changes made to the config file.
+    pub fn from_default_config() -> Self {
+        Self::from_config_file(default_config_path())
+    }
+
+    /// Creates a catalog backed by a specific JSON configuration file path.
+    /// If the file does not exist or cannot be parsed yet, falls back to `LauncherConfig::default()`.
+    pub fn from_config_file(path: PathBuf) -> Self {
+        let config = ConfigManager::load_from_file(&path).unwrap_or_default();
+        let mut catalog = Self::with_config(config);
+        catalog.config_path = Some(path);
         catalog
     }
 
@@ -57,13 +75,16 @@ impl IndexCatalog {
         } else {
             Some(config.custom_dirs)
         };
+        let mut matcher = SearchMatcher::new();
+        matcher.set_min_score_ratio(config.min_score_ratio);
         let mut catalog = Self {
             entries: Vec::new(),
             custom_entries,
             by_id: HashMap::new(),
-            matcher: SearchMatcher::new(),
+            matcher,
             custom_dirs,
             include_system_actions: config.include_system_actions,
+            config_path: None,
             frecency: FrecencyStore::open_default(),
         };
         catalog.reload();
@@ -79,7 +100,13 @@ impl IndexCatalog {
             Some(config.custom_dirs)
         };
         self.include_system_actions = config.include_system_actions;
+        self.matcher.set_min_score_ratio(config.min_score_ratio);
         self.reload()
+    }
+
+    /// Sets the relative score threshold ratio (`0.0..=1.0`) for filtering weak matches.
+    pub fn set_min_score_ratio(&mut self, ratio: f32) {
+        self.matcher.set_min_score_ratio(ratio);
     }
 
     /// Enables or disables inclusion of default system actions (Power Off, Restart, Lock, etc.).
@@ -101,8 +128,22 @@ impl IndexCatalog {
     }
 
     /// Reloads all desktop applications from disk and merges with custom and system actions.
+    /// If associated with a `config_path`, also hot-reloads configuration changes from disk.
     /// Returns the total number of indexed entries.
     pub fn reload(&mut self) -> usize {
+        if let Some(ref path) = self.config_path
+            && let Ok(config) = ConfigManager::load_from_file(path)
+        {
+            self.custom_entries = config.to_launcher_entries();
+            self.custom_dirs = if config.custom_dirs.is_empty() {
+                None
+            } else {
+                Some(config.custom_dirs)
+            };
+            self.include_system_actions = config.include_system_actions;
+            self.matcher.set_min_score_ratio(config.min_score_ratio);
+        }
+
         let scanned = match &self.custom_dirs {
             Some(dirs) => scan_desktop_entries_in_dirs(dirs),
             None => scan_desktop_entries(),
@@ -444,5 +485,65 @@ Exec=calendar
         catalog.tick(50);
         let results = catalog.results(2);
         assert_eq!(results[0].entry.id, "calendar.desktop");
+    }
+
+    #[test]
+    fn test_catalog_from_config_file_and_hot_reload() {
+        let temp = tempdir().unwrap();
+        let apps_dir = temp.path().join("applications");
+        let config_file = temp.path().join("config.json");
+        fs::create_dir_all(&apps_dir).unwrap();
+
+        fs::write(
+            &config_file,
+            format!(
+                r#"{{
+                    "custom_dirs": ["{}"],
+                    "include_system_actions": false,
+                    "custom_actions": [
+                        {{
+                            "id": "action:one",
+                            "name": "Action One",
+                            "action": {{ "type": "exec", "command": "echo 1" }}
+                        }}
+                    ]
+                }}"#,
+                apps_dir.display()
+            ),
+        )
+        .unwrap();
+
+        let mut catalog = IndexCatalog::from_config_file(config_file.clone());
+        assert_eq!(catalog.len(), 1);
+        assert!(catalog.get_by_id("action:one").is_some());
+
+        // Modify config.json on disk to add a second custom action and reload
+        fs::write(
+            &config_file,
+            format!(
+                r#"{{
+                    "custom_dirs": ["{}"],
+                    "include_system_actions": false,
+                    "custom_actions": [
+                        {{
+                            "id": "action:one",
+                            "name": "Action One",
+                            "action": {{ "type": "exec", "command": "echo 1" }}
+                        }},
+                        {{
+                            "id": "action:two",
+                            "name": "Action Two",
+                            "action": {{ "type": "exec", "command": "echo 2" }}
+                        }}
+                    ]
+                }}"#,
+                apps_dir.display()
+            ),
+        )
+        .unwrap();
+
+        let new_count = catalog.reload();
+        assert_eq!(new_count, 2);
+        assert!(catalog.get_by_id("action:two").is_some());
     }
 }

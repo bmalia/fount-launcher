@@ -10,7 +10,10 @@ pub mod frecency;
 pub mod index;
 pub mod matcher;
 
-pub use config_manager::{ConfigManager, CustomActionDef, CustomEntryConfig, LauncherConfig};
+pub use config_manager::{
+    ConfigManager, CustomActionDef, CustomEntryConfig, LauncherConfig, default_config_path,
+    default_min_score_ratio,
+};
 pub use desktop_entry::{
     DesktopEntry, clean_exec, get_application_search_dirs, scan_desktop_entries,
     scan_desktop_entries_in_dirs,
